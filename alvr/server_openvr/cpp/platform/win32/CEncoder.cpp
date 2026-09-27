@@ -1,0 +1,184 @@
+#include "CEncoder.h"
+#include "alvr_server/Settings.h"
+
+CEncoder::CEncoder()
+    : m_bExiting(false)
+    , m_targetTimestampNs(0) {
+    m_encodeFinished.Set();
+}
+
+CEncoder::~CEncoder() {
+    if (m_videoEncoder) {
+        m_videoEncoder->Shutdown();
+        m_videoEncoder.reset();
+    }
+}
+
+void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
+    m_FrameRender = std::make_shared<FrameRender>(d3dRender);
+    m_FrameRender->Startup();
+    uint32_t encoderWidth, encoderHeight;
+    m_FrameRender->GetEncodingResolution(&encoderWidth, &encoderHeight);
+
+#ifdef ALVR_JPEGXS
+    // JPEG XS is a software encoder, always "available" if compiled in --
+    // unlike AMF/NVENC below, this is a deterministic selection based on
+    // the user's actual codec choice, not a hardware-availability probe.
+    // Checked first so it takes priority when selected; falls through to
+    // the normal AMF/NVENC(/SW) probing chain below on failure (or if not
+    // selected), exactly like those backends' own failures already do.
+    if (Settings::Instance().m_codec == ALVR_CODEC_JPEGXS) {
+        try {
+            Debug("Try to use VideoEncoderJpegXs (selected codec).\n");
+            m_videoEncoder
+                = std::make_shared<VideoEncoderJpegXs>(d3dRender, encoderWidth, encoderHeight);
+            m_videoEncoder->Initialize();
+            return;
+        } catch (Exception e) {
+            Error(
+                "CEncoder: VideoEncoderJpegXs failed to initialize (%s), falling back to "
+                "hardware encoder probing.\n",
+                e.what()
+            );
+        }
+    }
+#else
+    if (Settings::Instance().m_codec == ALVR_CODEC_JPEGXS) {
+        Warn("CEncoder: JpegXs codec selected but server was built without ALVR_JPEGXS support; "
+             "falling back to hardware encoder probing.\n");
+    }
+#endif
+
+    Exception vceException;
+    Exception nvencException;
+#ifdef ALVR_GPL
+    Exception swException;
+    if (Settings::Instance().m_force_sw_encoding) {
+        try {
+            Debug("Try to use VideoEncoderSW.\n");
+            m_videoEncoder
+                = std::make_shared<VideoEncoderSW>(d3dRender, encoderWidth, encoderHeight);
+            m_videoEncoder->Initialize();
+            return;
+        } catch (Exception e) {
+            swException = e;
+        }
+    }
+#endif
+
+    try {
+        Debug("Try to use VideoEncoderAMF.\n");
+        m_videoEncoder = std::make_shared<VideoEncoderAMF>(d3dRender, encoderWidth, encoderHeight);
+        m_videoEncoder->Initialize();
+        return;
+    } catch (Exception e) {
+        vceException = e;
+    }
+    try {
+        Debug("Try to use VideoEncoderNVENC.\n");
+        m_videoEncoder
+            = std::make_shared<VideoEncoderNVENC>(d3dRender, encoderWidth, encoderHeight);
+        m_videoEncoder->Initialize();
+        return;
+    } catch (Exception e) {
+        nvencException = e;
+    }
+#ifdef ALVR_GPL
+    try {
+        Debug("Try to use VideoEncoderSW.\n");
+        m_videoEncoder = std::make_shared<VideoEncoderSW>(d3dRender, encoderWidth, encoderHeight);
+        m_videoEncoder->Initialize();
+        return;
+    } catch (Exception e) {
+        swException = e;
+    }
+    throw MakeException(
+        "All VideoEncoder are not available. VCE: %s, NVENC: %s, SW: %s",
+        vceException.what(),
+        nvencException.what(),
+        swException.what()
+    );
+#else
+    throw MakeException(
+        "All VideoEncoder are not available. VCE: %s, NVENC: %s",
+        vceException.what(),
+        nvencException.what()
+    );
+#endif
+}
+
+void CEncoder::SetViewsConfig(
+    vr::HmdRect2_t projLeft,
+    vr::HmdMatrix34_t eyeToHeadLeft,
+    vr::HmdRect2_t projRight,
+    vr::HmdMatrix34_t eyeToHeadRight
+) {
+    m_FrameRender->SetViewsConfig(projLeft, eyeToHeadLeft, projRight, eyeToHeadRight);
+}
+
+bool CEncoder::CopyToStaging(
+    ID3D11Texture2D* pTexture[][2],
+    vr::VRTextureBounds_t bounds[][2],
+    vr::HmdMatrix34_t poses[],
+    int layerCount,
+    bool recentering,
+    uint64_t presentationTime,
+    uint64_t targetTimestampNs,
+    const std::string& message,
+    const std::string& debugText
+) {
+    m_presentationTime = presentationTime;
+    m_targetTimestampNs = targetTimestampNs;
+    m_FrameRender->Startup();
+
+    m_FrameRender->RenderFrame(
+        pTexture, bounds, poses, layerCount, recentering, message, debugText
+    );
+    return true;
+}
+
+void CEncoder::Run() {
+    Debug("CEncoder: Start thread. Id=%d\n", GetCurrentThreadId());
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_MOST_URGENT);
+
+    while (!m_bExiting) {
+        m_newFrameReady.Wait();
+        if (m_bExiting)
+            break;
+
+        if (m_FrameRender->GetTexture()) {
+            bool insertIDR = m_scheduler.CheckIDRInsertion();
+
+            m_videoEncoder->Transmit(
+                m_FrameRender->GetTexture().Get(),
+                m_presentationTime,
+                m_targetTimestampNs,
+                insertIDR
+            );
+        }
+
+        m_encodeFinished.Set();
+    }
+}
+
+void CEncoder::Stop() {
+    m_bExiting = true;
+    m_newFrameReady.Set();
+    Join();
+    m_FrameRender.reset();
+}
+
+void CEncoder::NewFrameReady() {
+    m_encodeFinished.Reset();
+    m_newFrameReady.Set();
+}
+
+void CEncoder::WaitForEncode() { m_encodeFinished.Wait(); }
+
+void CEncoder::OnStreamStart() { m_scheduler.OnStreamStart(); }
+
+void CEncoder::OnPacketLoss() { m_scheduler.OnPacketLoss(); }
+
+void CEncoder::InsertIDR() { m_scheduler.InsertIDR(); }
+
+void CEncoder::CaptureFrame() { }
